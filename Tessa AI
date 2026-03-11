@@ -1,0 +1,922 @@
+import { useState, useEffect, useRef } from "react";
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   TESSA  —  Personal AI Assistant  |  Complete UI Redesign
+   Layout: Full-screen immersive. Floating top nav bar. No sidebar.
+   Aesthetic: Warm cream paper + deep ink — editorial magazine meets AI terminal
+   Fonts: Playfair Display (headings) + DM Mono (body/chat)
+══════════════════════════════════════════════════════════════════════════════ */
+
+const MODEL = "claude-sonnet-4-20250514";
+const load  = (k, fb) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; } };
+const save  = (k, v)  => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const uid   = () => Math.random().toString(36).slice(2, 10);
+const nowISO= () => new Date().toISOString();
+const fmtT  = (iso) => new Date(iso).toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
+const fmtDT = (iso) => new Date(iso).toLocaleString([], { month:"short", day:"numeric", hour:"2-digit", minute:"2-digit" });
+const until = (iso) => {
+  const d = new Date(iso) - Date.now();
+  if (d <= 0) return "now";
+  const m = Math.floor(d/60000), h = Math.floor(m/60), dy = Math.floor(h/24);
+  return dy>0 ? `${dy}d ${h%24}h` : h>0 ? `${h}h ${m%60}m` : `${m}m`;
+};
+const fmtSize = (b) => b > 1048576 ? `${(b/1048576).toFixed(1)} MB` : `${(b/1024).toFixed(0)} KB`;
+
+const toB64  = (f) => new Promise((res,rej) => { const r=new FileReader(); r.onload=()=>res(r.result.split(",")[1]); r.onerror=rej; r.readAsDataURL(f); });
+const toText = (f) => new Promise((res,rej) => { const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsText(f); });
+
+const SYSTEM = `You are Tessa, a warm, sharp, and deeply capable personal AI. You have access to:
+1. Files the user has shared (contents provided in context)
+2. Web search for current, real-world information
+3. Reminder creation — when the user asks, output exactly this on its own line:
+   REMINDER:{"title":"...","datetime":"ISO8601","note":"..."}
+
+Be concise, warm, and honest. Synthesize web results naturally. Confirm reminders conversationally after outputting the JSON line.`;
+
+async function processFile(file) {
+  if (file.size > 5*1024*1024) throw new Error("too large");
+  if (file.type.startsWith("image/"))  return { contentType:"image", content: await toB64(file) };
+  if (file.type === "application/pdf") return { contentType:"pdf",   content: await toB64(file) };
+  return { contentType:"text", content: await toText(file) };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+export default function TessaApp() {
+  const [messages,  setMessages]  = useState(() => load("t_msgs",  []));
+  const [files,     setFiles]     = useState(() => load("t_files", []));
+  const [reminders, setReminders] = useState(() => load("t_rems",  []));
+  const [input,     setInput]     = useState("");
+  const [thinking,  setThinking]  = useState(false);
+  const [view,      setView]      = useState("chat");
+  const [fired,     setFired]     = useState(new Set());
+  const [toast,     setToast]     = useState(null);
+  const [clock,     setClock]     = useState(new Date());
+
+  const bottomRef = useRef();
+  const inputRef  = useRef();
+  const fileRef   = useRef();
+
+  useEffect(() => save("t_msgs",  messages.slice(-100)), [messages]);
+  useEffect(() => save("t_files", files),                [files]);
+  useEffect(() => save("t_rems",  reminders),            [reminders]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [messages, thinking]);
+  useEffect(() => { const t = setInterval(() => setClock(new Date()), 30000); return () => clearInterval(t); }, []);
+
+  useEffect(() => {
+    if (Notification.permission === "default") Notification.requestPermission();
+    const t = setInterval(() => {
+      reminders.forEach(r => {
+        if (!r.done && !fired.has(r.id) && new Date(r.datetime) <= Date.now()) {
+          setFired(p => new Set([...p, r.id]));
+          setReminders(p => p.map(x => x.id===r.id ? {...x, done:true} : x));
+          showToast(`⏰  ${r.title}`, r.note);
+          if (Notification.permission==="granted") new Notification(`Tessa: ${r.title}`, {body: r.note||""});
+        }
+      });
+    }, 15000);
+    return () => clearInterval(t);
+  }, [reminders, fired]);
+
+  const showToast = (title, body="") => {
+    setToast({title, body});
+    setTimeout(() => setToast(null), 4500);
+  };
+
+  const onFiles = async (e) => {
+    for (const file of Array.from(e.target.files)) {
+      try {
+        const { contentType, content } = await processFile(file);
+        setFiles(p => [...p.filter(f=>f.name!==file.name), { id:uid(), name:file.name, type:file.type, contentType, size:file.size, content, addedAt:nowISO() }]);
+        showToast("File loaded", file.name);
+      } catch { showToast("Skipped", `${file.name} — too large`); }
+    }
+    e.target.value = "";
+  };
+
+  const buildPayload = (text) => {
+    const history = messages.slice(-20).map(m => ({ role:m.role, content:m.content }));
+    const parts = [];
+    files.forEach(f => {
+      if (f.contentType==="image") parts.push({ type:"image", source:{ type:"base64", media_type:f.type, data:f.content }});
+      else if (f.contentType==="pdf") parts.push({ type:"document", source:{ type:"base64", media_type:"application/pdf", data:f.content }});
+    });
+    const txtCtx = files.filter(f=>f.contentType==="text").map(f=>`--- ${f.name} ---\n${f.content.slice(0,8000)}`).join("\n\n");
+    parts.push({ type:"text", text:(txtCtx ? txtCtx+"\n\n" : "") + text });
+    return [...history, { role:"user", content: parts.length===1 ? parts[0].text : parts }];
+  };
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || thinking) return;
+    setInput("");
+    setMessages(p => [...p, { id:uid(), role:"user", content:text, ts:nowISO() }]);
+    setThinking(true);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ model:MODEL, max_tokens:1000, system:SYSTEM,
+          tools:[{ type:"web_search_20250305", name:"web_search" }],
+          messages: buildPayload(text) }),
+      });
+      const data = await res.json();
+      let txt = (data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+      const searched = (data.content||[]).some(b=>b.type==="tool_use");
+      const rm = txt.match(/REMINDER:(\{[^\n]+\})/);
+      if (rm) {
+        try {
+          const rd = JSON.parse(rm[1]);
+          setReminders(p => [...p, { id:uid(), title:rd.title, datetime:rd.datetime, note:rd.note||"", done:false, createdAt:nowISO() }]);
+          txt = txt.replace(/REMINDER:\{[^\n]+\}/, "").trim();
+        } catch {}
+      }
+      setMessages(p => [...p, { id:uid(), role:"assistant", content:txt||"…", ts:nowISO(), searched }]);
+    } catch(err) {
+      setMessages(p => [...p, { id:uid(), role:"assistant", content:`Error: ${err.message}`, ts:nowISO(), error:true }]);
+    }
+    setThinking(false);
+    setTimeout(() => inputRef.current?.focus(), 80);
+  };
+
+  const pendingCount = reminders.filter(r=>!r.done).length;
+  const hhmm = clock.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
+  const ddmm = clock.toLocaleDateString([], { weekday:"short", month:"short", day:"numeric" });
+
+  return (
+    <div className="root">
+      <GlobalCSS />
+
+      {toast && (
+        <div className="toast">
+          <div className="toast-icon">◉</div>
+          <div style={{flex:1}}>
+            <div className="toast-title">{toast.title}</div>
+            {toast.body && <div className="toast-body">{toast.body}</div>}
+          </div>
+          <button className="toast-x" onClick={()=>setToast(null)}>×</button>
+        </div>
+      )}
+
+      {/* ── TOP NAV ── */}
+      <header className="topnav">
+        <div className="nav-left">
+          <div className="tessa-brand">
+            <span className="brand-dot" />
+            <span className="brand-name">TESSA</span>
+          </div>
+          <div className="nav-clock">
+            <span className="clock-time">{hhmm}</span>
+            <span className="clock-date">{ddmm}</span>
+          </div>
+        </div>
+
+        <nav className="nav-tabs">
+          {[
+            { key:"chat",      label:"Chat",      glyph:"↗" },
+            { key:"files",     label:"Files",     glyph:"⊞", badge: files.length||0 },
+            { key:"reminders", label:"Reminders", glyph:"◷", badge: pendingCount },
+          ].map(({ key, label, glyph, badge }) => (
+            <button key={key} className={`nav-tab ${view===key?"nav-tab--on":""}`}
+              onClick={()=>setView(key)}>
+              <span className="tab-glyph">{glyph}</span>
+              <span className="tab-label">{label}</span>
+              {badge>0 && <span className="tab-badge">{badge}</span>}
+            </button>
+          ))}
+        </nav>
+
+        <div className="nav-right">
+          {files.length>0 && <div className="files-pill">{files.length} file{files.length>1?"s":""} active</div>}
+          <button className="nav-icon-btn" onClick={()=>fileRef.current?.click()} title="Attach file">⊕</button>
+          <button className="nav-icon-btn" onClick={()=>{ if(confirm("Clear chat history?")) setMessages([]); }} title="Clear">⌫</button>
+        </div>
+        <input ref={fileRef} type="file" multiple style={{display:"none"}} onChange={onFiles} />
+      </header>
+
+      {/* ── MAIN ── */}
+      <main className="main-area">
+
+        {/* CHAT */}
+        {view==="chat" && (
+          <div className="chat-wrap">
+            <div className="msg-stream">
+              {messages.length===0 && (
+                <WelcomeScreen onSuggest={t=>{setInput(t); setTimeout(()=>inputRef.current?.focus(),50);}} />
+              )}
+              {messages.map((m) => (
+                <div key={m.id} className={`msg-row ${m.role==="user"?"msg-row--user":"msg-row--ai"}`}>
+                  {m.role==="assistant" && (
+                    <div className="ai-label">
+                      <span className="ai-glyph">◈</span>
+                      <span>Tessa</span>
+                      {m.searched && <span className="searched-badge">web</span>}
+                    </div>
+                  )}
+                  <div className={`bubble ${m.role==="user"?"bubble--user":"bubble--ai"}${m.error?" bubble--err":""}`}>
+                    <MsgText text={m.content} />
+                  </div>
+                  <div className={`msg-time ${m.role==="user"?"msg-time--r":""}`}>{fmtT(m.ts)}</div>
+                </div>
+              ))}
+              {thinking && (
+                <div className="msg-row msg-row--ai">
+                  <div className="ai-label"><span className="ai-glyph">◈</span><span>Tessa</span></div>
+                  <div className="bubble bubble--ai bubble--thinking">
+                    <span className="t-dot"/><span className="t-dot"/><span className="t-dot"/>
+                  </div>
+                </div>
+              )}
+              <div ref={bottomRef}/>
+            </div>
+
+            <div className="input-dock">
+              {files.length>0 && (
+                <div className="active-files-bar">
+                  {files.map(f=>(
+                    <span key={f.id} className="af-tag">
+                      {f.contentType==="image"?"⬡":f.contentType==="pdf"?"▤":"≡"}{" "}
+                      {f.name.length>20 ? f.name.slice(0,20)+"…" : f.name}
+                      <button className="af-remove" onClick={()=>setFiles(p=>p.filter(x=>x.id!==f.id))}>×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="input-box">
+                <textarea
+                  ref={inputRef}
+                  className="chat-input"
+                  placeholder="Ask Tessa anything…   or try:  remind me to…"
+                  value={input}
+                  onChange={e=>setInput(e.target.value)}
+                  onKeyDown={e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); send(); }}}
+                  rows={1}
+                />
+                <button
+                  className={`send-btn${(!input.trim()||thinking)?" send-btn--off":""}`}
+                  onClick={send}
+                  disabled={!input.trim()||thinking}
+                >
+                  {thinking ? <span className="spin">◌</span> : "↑"}
+                </button>
+              </div>
+              <div className="input-meta">
+                <span>↵ send</span><span>⇧↵ newline</span><span>⊕ attach files via nav</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* FILES */}
+        {view==="files" && (
+          <div className="panel-wrap">
+            <div className="panel-hero">
+              <div>
+                <div className="panel-eyebrow">FILE VAULT</div>
+                <h1 className="panel-title">Your Documents</h1>
+                <p className="panel-sub">Tessa reads every file you add and references them in chat.</p>
+              </div>
+              <button className="big-add-btn" onClick={()=>fileRef.current?.click()}>
+                <span className="big-add-glyph">⊕</span> Add Files
+              </button>
+            </div>
+
+            {files.length===0 ? (
+              <div className="empty-state">
+                <div className="empty-glyph">⬡</div>
+                <p className="empty-title">No files yet</p>
+                <p className="empty-sub">Drop in text files, PDFs, or images and Tessa will know about them instantly.</p>
+                <button className="big-add-btn" style={{marginTop:24}} onClick={()=>fileRef.current?.click()}>Browse files</button>
+              </div>
+            ) : (
+              <div className="files-table">
+                <div className="files-thead">
+                  <span>Name</span><span>Type</span><span>Size</span><span>Added</span><span></span>
+                </div>
+                {files.map((f,i) => (
+                  <div key={f.id} className="files-row" style={{"--i":i}}>
+                    <span className="frow-name">
+                      <span className="frow-icon">{f.contentType==="image"?"⬡":f.contentType==="pdf"?"▤":"≡"}</span>
+                      {f.name}
+                    </span>
+                    <span className="frow-badge">{f.contentType}</span>
+                    <span className="frow-muted">{fmtSize(f.size)}</span>
+                    <span className="frow-muted">{fmtDT(f.addedAt)}</span>
+                    <button className="frow-del" onClick={()=>setFiles(p=>p.filter(x=>x.id!==f.id))}>Remove</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* REMINDERS */}
+        {view==="reminders" && (
+          <RemindersView reminders={reminders} setReminders={setReminders} />
+        )}
+      </main>
+    </div>
+  );
+}
+
+// ── Welcome ────────────────────────────────────────────────────────────────────
+function WelcomeScreen({ onSuggest }) {
+  const chips = [
+    "What's in the news today?",
+    "Remind me to call mom at 6 pm",
+    "Summarize the file I uploaded",
+    "What's the weather right now?",
+    "Write me a short professional bio",
+    "What time is it in Tokyo?",
+  ];
+  return (
+    <div className="welcome">
+      <div className="welcome-mark">T</div>
+      <h1 className="welcome-heading">Good to see you.</h1>
+      <p className="welcome-body">
+        I'm Tessa — your personal AI. Ask me anything, set reminders,<br/>
+        or hand me a file and let's get to work.
+      </p>
+      <div className="chips-grid">
+        {chips.map(c => (
+          <button key={c} className="chip" onClick={()=>onSuggest(c)}>{c}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Message text renderer ──────────────────────────────────────────────────────
+function MsgText({ text }) {
+  if (!text) return null;
+  return (
+    <>
+      {text.split("\n").map((line, i, arr) => {
+        const parts = line.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+        return (
+          <span key={i}>
+            {parts.map((p, j) => {
+              if (p.startsWith("`") && p.endsWith("`")) return <code key={j} className="icode">{p.slice(1,-1)}</code>;
+              if (p.startsWith("**") && p.endsWith("**")) return <strong key={j}>{p.slice(2,-2)}</strong>;
+              return p;
+            })}
+            {i < arr.length - 1 && <br/>}
+          </span>
+        );
+      })}
+    </>
+  );
+}
+
+// ── Reminders panel ────────────────────────────────────────────────────────────
+function RemindersView({ reminders, setReminders }) {
+  const [form,   setForm]   = useState({ title:"", datetime:"", note:"" });
+  const [adding, setAdding] = useState(false);
+
+  const pending = reminders.filter(r=>!r.done).sort((a,b)=>new Date(a.datetime)-new Date(b.datetime));
+  const done    = reminders.filter(r=>r.done).sort((a,b)=>new Date(b.datetime)-new Date(a.datetime));
+
+  const add = () => {
+    if (!form.title || !form.datetime) return;
+    setReminders(p => [...p, { id:uid(), ...form, done:false, createdAt:nowISO() }]);
+    setForm({ title:"", datetime:"", note:"" });
+    setAdding(false);
+  };
+
+  return (
+    <div className="panel-wrap">
+      <div className="panel-hero">
+        <div>
+          <div className="panel-eyebrow">REMINDERS</div>
+          <h1 className="panel-title">{pending.length} Upcoming</h1>
+          <p className="panel-sub">Or just tell Tessa in chat — "remind me to…"</p>
+        </div>
+        <button className="big-add-btn" onClick={()=>setAdding(a=>!a)}>
+          <span className="big-add-glyph">{adding?"×":"+"}</span>
+          {adding ? "Cancel" : "New Reminder"}
+        </button>
+      </div>
+
+      {adding && (
+        <div className="rform">
+          <div className="rform-grid">
+            <div className="rform-field">
+              <label className="rform-label">What should I remind you?</label>
+              <input className="rform-input" placeholder="e.g. Call the dentist"
+                value={form.title} onChange={e=>setForm(f=>({...f,title:e.target.value}))} />
+            </div>
+            <div className="rform-field">
+              <label className="rform-label">When?</label>
+              <input className="rform-input" type="datetime-local"
+                value={form.datetime} onChange={e=>setForm(f=>({...f,datetime:e.target.value}))} />
+            </div>
+          </div>
+          <div className="rform-field" style={{marginTop:14}}>
+            <label className="rform-label">Note (optional)</label>
+            <input className="rform-input" placeholder="Extra context…"
+              value={form.note} onChange={e=>setForm(f=>({...f,note:e.target.value}))} />
+          </div>
+          <button className="big-add-btn" style={{marginTop:20}} onClick={add}>Save Reminder</button>
+        </div>
+      )}
+
+      {reminders.length===0 && !adding && (
+        <div className="empty-state">
+          <div className="empty-glyph">◷</div>
+          <p className="empty-title">No reminders yet</p>
+          <p className="empty-sub">Create one here, or tell Tessa: "remind me to drink water every 2 hours"</p>
+        </div>
+      )}
+
+      {pending.length>0 && (
+        <>
+          <div className="rem-section-label">UPCOMING</div>
+          <div className="rem-list">
+            {pending.map((r,i) => (
+              <RCard key={r.id} r={r} i={i}
+                onToggle={id=>setReminders(p=>p.map(x=>x.id===id?{...x,done:!x.done}:x))}
+                onDel={id=>setReminders(p=>p.filter(x=>x.id!==id))}
+              />
+            ))}
+          </div>
+        </>
+      )}
+      {done.length>0 && (
+        <>
+          <div className="rem-section-label" style={{marginTop:32}}>COMPLETED</div>
+          <div className="rem-list">
+            {done.map((r,i) => (
+              <RCard key={r.id} r={r} i={i}
+                onToggle={id=>setReminders(p=>p.map(x=>x.id===id?{...x,done:!x.done}:x))}
+                onDel={id=>setReminders(p=>p.filter(x=>x.id!==id))}
+              />
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function RCard({ r, i, onToggle, onDel }) {
+  const overdue = !r.done && new Date(r.datetime) < Date.now();
+  return (
+    <div className={`rcard${r.done?" rcard--done":""}${overdue?" rcard--overdue":""}`} style={{"--i":i}}>
+      <button className={`rcard-check${r.done?" rcard-check--done":""}`} onClick={()=>onToggle(r.id)}>
+        {r.done && "✓"}
+      </button>
+      <div className="rcard-body">
+        <div className="rcard-title">{r.title}</div>
+        {r.note && <div className="rcard-note">{r.note}</div>}
+        <div className="rcard-meta">
+          <span className="rcard-time">{fmtDT(r.datetime)}</span>
+          {!r.done && (
+            <span className={`rcard-countdown${overdue?" rcard-countdown--late":""}`}>
+              {overdue ? "overdue" : until(r.datetime)}
+            </span>
+          )}
+        </div>
+      </div>
+      <button className="rcard-del" onClick={()=>onDel(r.id)}>×</button>
+    </div>
+  );
+}
+
+// ── All styles in one CSS injection ───────────────────────────────────────────
+function GlobalCSS() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Mono:wght@300;400;500&display=swap');
+
+      *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+      html, body, #root { height:100%; }
+
+      .root {
+        min-height: 100vh;
+        background: #F5F0E8;
+        color: #0E0C0A;
+        font-family: 'DM Mono', monospace;
+        display: flex;
+        flex-direction: column;
+        position: relative;
+        overflow: hidden;
+      }
+
+      /* Paper grain */
+      .root::before {
+        content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");
+        background-size: 300px;
+      }
+
+      /* ─── TOP NAV ─────────────────────────────────────────────────── */
+      .topnav {
+        position: sticky; top:0; z-index:100;
+        display: flex; align-items: center;
+        background: #0E0C0A;
+        border-bottom: 2px solid #9A7A45;
+        padding: 0 28px; height: 56px; flex-shrink: 0;
+        gap: 0;
+      }
+
+      .nav-left { display:flex; align-items:center; gap:20px; margin-right:auto; }
+
+      .tessa-brand { display:flex; align-items:center; gap:9px; }
+      .brand-dot {
+        width:8px; height:8px; border-radius:50%;
+        background:#C8A96E; box-shadow:0 0 10px #C8A96E;
+        animation: blink 2.4s ease-in-out infinite;
+      }
+      .brand-name {
+        font-family:'DM Mono',monospace; font-weight:500; font-size:14px;
+        letter-spacing:5px; color:#F5F0E8; text-transform:uppercase;
+      }
+
+      .nav-clock {
+        border-left:1px solid #2A2520; padding-left:18px;
+        display:flex; flex-direction:column; justify-content:center;
+      }
+      .clock-time { font-size:12px; color:#C8A96E; letter-spacing:1.5px; line-height:1.3; }
+      .clock-date { font-size:9px; color:#4A4540; letter-spacing:1px; margin-top:1px; }
+
+      .nav-tabs { display:flex; height:56px; }
+      .nav-tab {
+        display:flex; align-items:center; gap:7px;
+        padding:0 20px; height:100%;
+        background:transparent; border:none; border-bottom:3px solid transparent;
+        margin-bottom:-2px;
+        color:#6A6050; cursor:pointer;
+        font-family:'DM Mono',monospace; font-size:10.5px;
+        letter-spacing:2px; text-transform:uppercase;
+        transition:all .18s; position:relative;
+      }
+      .nav-tab:hover { color:#EDE8DC; }
+      .nav-tab--on { color:#C8A96E; border-bottom-color:#C8A96E; }
+      .tab-glyph { font-size:15px; line-height:1; }
+      .tab-badge {
+        background:#C8A96E; color:#0E0C0A;
+        border-radius:99px; padding:1px 7px;
+        font-size:9px; font-weight:500; letter-spacing:0;
+      }
+
+      .nav-right { display:flex; align-items:center; gap:10px; margin-left:24px; }
+      .files-pill {
+        background:rgba(200,169,110,0.12); border:1px solid #9A7A45;
+        border-radius:4px; padding:3px 10px;
+        font-size:9px; color:#C8A96E; letter-spacing:1.5px; text-transform:uppercase;
+      }
+      .nav-icon-btn {
+        background:transparent; border:1px solid #2A2520; border-radius:6px;
+        padding:7px 11px; color:#6A6050; cursor:pointer;
+        font-size:15px; line-height:1; transition:all .18s;
+      }
+      .nav-icon-btn:hover { border-color:#9A7A45; color:#C8A96E; }
+
+      /* ─── MAIN ────────────────────────────────────────────────────── */
+      .main-area {
+        flex:1; display:flex; flex-direction:column;
+        overflow:hidden; position:relative; z-index:1;
+      }
+
+      /* ─── CHAT ────────────────────────────────────────────────────── */
+      .chat-wrap {
+        flex:1; display:flex; flex-direction:column;
+        max-width:760px; width:100%; margin:0 auto;
+        min-height:0;
+      }
+
+      .msg-stream {
+        flex:1; overflow-y:auto; padding:36px 20px 16px;
+        display:flex; flex-direction:column; gap:0;
+      }
+      .msg-stream::-webkit-scrollbar { width:3px; }
+      .msg-stream::-webkit-scrollbar-thumb { background:#D9D0BE; border-radius:3px; }
+
+      .msg-row { margin-bottom:22px; animation:slideIn .2s ease; }
+      .msg-row--user { display:flex; flex-direction:column; align-items:flex-end; }
+      .msg-row--ai   { display:flex; flex-direction:column; align-items:flex-start; }
+
+      .ai-label {
+        display:flex; align-items:center; gap:6px;
+        font-size:9px; font-weight:500; letter-spacing:2.5px; text-transform:uppercase;
+        color:#8A8070; margin-bottom:7px;
+      }
+      .ai-glyph { color:#C8A96E; font-size:14px; }
+      .searched-badge {
+        background:#0E0C0A; color:#C8A96E;
+        border:1px solid #9A7A45; border-radius:3px;
+        padding:1px 7px; font-size:8px; letter-spacing:2px; text-transform:uppercase;
+      }
+
+      .bubble {
+        max-width:70%; padding:14px 20px;
+        font-family:'DM Mono',monospace; font-size:13.5px; line-height:1.85;
+        word-break:break-word;
+      }
+      .bubble--ai {
+        background:#0E0C0A; color:#EDE8DC;
+        border-radius:2px 18px 18px 18px;
+        border-left:3px solid #9A7A45;
+      }
+      .bubble--user {
+        background:#EDE8DC; color:#0E0C0A;
+        border-radius:18px 2px 18px 18px;
+        border:1px solid #D5CCBA; border-right:3px solid #C8A96E;
+      }
+      .bubble--err { border-left-color:#C0392B; }
+      .bubble--thinking {
+        display:flex; align-items:center; gap:8px; padding:16px 20px;
+      }
+
+      .t-dot {
+        width:7px; height:7px; border-radius:50%;
+        background:#C8A96E; display:inline-block;
+      }
+      .t-dot:nth-child(1){animation:td 1.1s ease-in-out infinite 0s;}
+      .t-dot:nth-child(2){animation:td 1.1s ease-in-out infinite .18s;}
+      .t-dot:nth-child(3){animation:td 1.1s ease-in-out infinite .36s;}
+
+      .msg-time { font-size:9px; color:#8A8070; letter-spacing:1px; margin-top:5px; }
+      .msg-time--r { text-align:right; }
+
+      .icode {
+        background:rgba(200,169,110,0.1); color:#9A7A45;
+        padding:1px 6px; border-radius:3px; font-size:12px;
+        border:1px solid rgba(200,169,110,0.2);
+      }
+
+      /* ─── INPUT DOCK ──────────────────────────────────────────────── */
+      .input-dock {
+        border-top:1px solid #D9D0BE;
+        background:#F5F0E8;
+        padding:14px 20px 18px;
+        flex-shrink:0;
+      }
+
+      .active-files-bar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+      .af-tag {
+        background:rgba(14,12,10,0.05); border:1px solid #D9D0BE;
+        border-radius:4px; padding:3px 8px 3px 10px;
+        font-size:10px; color:#4A4540; display:flex; align-items:center; gap:6px;
+        font-family:'DM Mono',monospace;
+      }
+      .af-remove { background:none; border:none; cursor:pointer; color:#8A8070; font-size:14px; line-height:1; }
+
+      .input-box {
+        display:flex; gap:10px; align-items:flex-end;
+        background:#0E0C0A; border:1px solid #2A2520;
+        border-radius:12px; padding:4px 4px 4px 18px;
+        transition:border-color .2s;
+      }
+      .input-box:focus-within { border-color:#9A7A45; }
+
+      .chat-input {
+        flex:1; background:transparent; border:none; outline:none;
+        color:#EDE8DC; font-family:'DM Mono',monospace;
+        font-size:13.5px; line-height:1.65; resize:none;
+        max-height:150px; overflow-y:auto; padding:10px 0;
+        caret-color:#C8A96E;
+      }
+      .chat-input::placeholder { color:#3A3530; }
+
+      .send-btn {
+        width:42px; height:42px; border-radius:9px; flex-shrink:0;
+        background:#C8A96E; border:none; cursor:pointer;
+        color:#0E0C0A; font-size:19px; font-weight:700;
+        display:flex; align-items:center; justify-content:center;
+        transition:all .18s;
+      }
+      .send-btn--off { background:#2A2520; color:#4A4540; cursor:not-allowed; }
+      .send-btn:not(.send-btn--off):hover { background:#9A7A45; }
+
+      .spin { display:inline-block; animation:rotate .8s linear infinite; }
+
+      .input-meta {
+        display:flex; gap:18px; margin-top:8px;
+        font-size:9px; letter-spacing:1.2px; color:#B0A898; text-transform:uppercase;
+      }
+
+      /* ─── WELCOME ─────────────────────────────────────────────────── */
+      .welcome {
+        margin:auto; text-align:center;
+        padding:52px 24px; max-width:600px;
+        animation:fadeIn .5s ease;
+      }
+      .welcome-mark {
+        width:76px; height:76px; border-radius:16px;
+        background:#0E0C0A; color:#C8A96E;
+        font-family:'Playfair Display',serif; font-size:44px; font-weight:900;
+        display:flex; align-items:center; justify-content:center;
+        margin:0 auto 30px;
+        box-shadow:0 10px 40px rgba(14,12,10,0.22);
+      }
+      .welcome-heading {
+        font-family:'Playfair Display',serif; font-size:44px;
+        font-weight:900; color:#0E0C0A; letter-spacing:-1.5px;
+        line-height:1.1; margin-bottom:14px;
+      }
+      .welcome-body {
+        font-size:13px; color:#8A8070; line-height:1.9;
+        margin-bottom:38px;
+      }
+      .chips-grid {
+        display:grid; grid-template-columns:1fr 1fr; gap:10px;
+        max-width:520px; margin:0 auto;
+      }
+      .chip {
+        background:#0E0C0A; border:1px solid #2A2520;
+        border-radius:7px; padding:13px 16px;
+        color:#9A9080; font-family:'DM Mono',monospace;
+        font-size:11.5px; cursor:pointer; text-align:left;
+        line-height:1.5; transition:all .18s;
+      }
+      .chip:hover { background:#1C1916; border-color:#9A7A45; color:#C8A96E; }
+
+      /* ─── PANELS ──────────────────────────────────────────────────── */
+      .panel-wrap {
+        max-width:880px; width:100%; margin:0 auto;
+        padding:40px 28px; overflow-y:auto; flex:1;
+        animation:fadeIn .3s ease;
+      }
+      .panel-hero {
+        display:flex; align-items:flex-end; justify-content:space-between;
+        padding-bottom:28px; margin-bottom:28px;
+        border-bottom:1px solid #D9D0BE; flex-wrap:wrap; gap:16px;
+      }
+      .panel-eyebrow {
+        font-size:9px; font-weight:500; letter-spacing:3.5px;
+        color:#C8A96E; margin-bottom:7px; text-transform:uppercase;
+      }
+      .panel-title {
+        font-family:'Playfair Display',serif; font-size:38px;
+        font-weight:900; letter-spacing:-1.2px; color:#0E0C0A; line-height:1.1;
+      }
+      .panel-sub { font-size:12px; color:#8A8070; margin-top:6px; }
+
+      .big-add-btn {
+        display:flex; align-items:center; gap:9px;
+        background:#0E0C0A; color:#C8A96E;
+        border:1px solid #9A7A45; border-radius:8px;
+        padding:12px 22px; cursor:pointer;
+        font-family:'DM Mono',monospace; font-size:11px;
+        letter-spacing:1.5px; text-transform:uppercase; transition:all .18s;
+      }
+      .big-add-btn:hover { background:#C8A96E; color:#0E0C0A; border-color:#C8A96E; }
+      .big-add-glyph { font-size:18px; }
+
+      /* Files table */
+      .files-table { display:flex; flex-direction:column; }
+      .files-thead {
+        display:grid; grid-template-columns:2.5fr 90px 80px 160px 90px;
+        padding:8px 16px; gap:12px;
+        font-size:9px; letter-spacing:2.5px; color:#8A8070; text-transform:uppercase;
+        border-bottom:1px solid #D9D0BE; margin-bottom:4px;
+      }
+      .files-row {
+        display:grid; grid-template-columns:2.5fr 90px 80px 160px 90px;
+        align-items:center; gap:12px;
+        padding:14px 16px; border-bottom:1px solid #EDE8DC;
+        font-size:12px; animation:rowIn .25s ease both;
+        animation-delay:calc(var(--i)*40ms); transition:background .15s;
+      }
+      .files-row:hover { background:#EDE8DC; }
+      .frow-name { display:flex; align-items:center; gap:10px; color:#0E0C0A; font-weight:500; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+      .frow-icon { font-size:16px; flex-shrink:0; }
+      .frow-badge {
+        background:rgba(14,12,10,0.07); border:1px solid #D9D0BE;
+        border-radius:4px; padding:2px 8px; font-size:10px; color:#4A4540;
+        display:inline-block; text-align:center;
+      }
+      .frow-muted { color:#8A8070; font-size:11px; }
+      .frow-del {
+        background:none; border:1px solid #D9D0BE;
+        border-radius:4px; padding:4px 10px;
+        font-size:10px; color:#8A8070; cursor:pointer;
+        font-family:'DM Mono',monospace; letter-spacing:.5px; transition:all .15s;
+      }
+      .frow-del:hover { border-color:#C0392B; color:#C0392B; background:rgba(192,57,43,0.04); }
+
+      /* Reminders */
+      .rem-section-label {
+        font-size:9px; letter-spacing:3px; color:#8A8070;
+        text-transform:uppercase; margin-bottom:14px;
+      }
+      .rem-list { display:flex; flex-direction:column; gap:10px; }
+
+      .rform {
+        background:#EDE8DC; border:1px solid #D9D0BE;
+        border-radius:12px; padding:24px; margin-bottom:28px;
+        animation:slideIn .22s ease;
+      }
+      .rform-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+      .rform-field { display:flex; flex-direction:column; gap:6px; }
+      .rform-label {
+        font-size:9px; letter-spacing:2px; color:#8A8070; text-transform:uppercase;
+      }
+      .rform-input {
+        background:white; border:1px solid #D9D0BE; border-radius:6px;
+        padding:11px 14px; font-family:'DM Mono',monospace; font-size:13px;
+        color:#0E0C0A; outline:none; transition:border-color .18s;
+      }
+      .rform-input:focus { border-color:#9A7A45; }
+
+      .rcard {
+        display:flex; align-items:flex-start; gap:14px;
+        background:white; border:1px solid #EDE8DC;
+        border-radius:10px; padding:17px 18px;
+        border-left:4px solid #C8A96E;
+        animation:rowIn .25s ease both;
+        animation-delay:calc(var(--i)*40ms);
+        transition:box-shadow .18s;
+      }
+      .rcard:hover { box-shadow:0 4px 18px rgba(14,12,10,0.07); }
+      .rcard--done { opacity:.5; border-left-color:#D9D0BE; }
+      .rcard--overdue { border-left-color:#C0392B; }
+
+      .rcard-check {
+        width:22px; height:22px; border-radius:50%;
+        border:2px solid #D9D0BE; background:transparent;
+        cursor:pointer; flex-shrink:0; margin-top:2px;
+        display:flex; align-items:center; justify-content:center;
+        font-size:11px; font-weight:700; transition:all .18s; color:#0E0C0A;
+      }
+      .rcard-check--done { background:#C8A96E; border-color:#C8A96E; }
+      .rcard-check:not(.rcard-check--done):hover { border-color:#9A7A45; }
+
+      .rcard-body { flex:1; }
+      .rcard-title { font-weight:500; font-size:14px; color:#0E0C0A; }
+      .rcard-note  { font-size:11.5px; color:#8A8070; margin-top:3px; }
+      .rcard-meta  { display:flex; gap:12px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+      .rcard-time  { font-size:10px; color:#8A8070; letter-spacing:.5px; }
+      .rcard-countdown {
+        font-size:10px; background:rgba(200,169,110,0.1);
+        border:1px solid rgba(200,169,110,0.3); border-radius:4px;
+        padding:2px 8px; color:#9A7A45; letter-spacing:.5px;
+      }
+      .rcard-countdown--late {
+        background:rgba(192,57,43,0.07); border-color:rgba(192,57,43,0.3); color:#C0392B;
+      }
+      .rcard-del {
+        background:none; border:none; cursor:pointer;
+        color:#D9D0BE; font-size:20px; line-height:1;
+        padding:0 4px; transition:color .15s;
+      }
+      .rcard-del:hover { color:#C0392B; }
+
+      /* Empty */
+      .empty-state {
+        display:flex; flex-direction:column; align-items:center;
+        text-align:center; padding:72px 24px; color:#8A8070;
+      }
+      .empty-glyph { font-size:48px; margin-bottom:16px; color:#D9D0BE; }
+      .empty-title { font-family:'Playfair Display',serif; font-size:24px; color:#0E0C0A; margin-bottom:8px; }
+      .empty-sub   { font-size:12px; max-width:320px; line-height:1.9; }
+
+      /* Toast */
+      .toast {
+        position:fixed; bottom:28px; right:28px; z-index:9999;
+        display:flex; align-items:center; gap:12px;
+        background:#0E0C0A; border:1px solid #9A7A45;
+        border-radius:8px; padding:14px 18px;
+        min-width:260px; max-width:380px;
+        box-shadow:0 16px 48px rgba(14,12,10,0.35);
+        animation:toastIn .3s cubic-bezier(.34,1.3,.64,1);
+      }
+      .toast-icon { color:#C8A96E; font-size:15px; flex-shrink:0; }
+      .toast-title { color:#EDE8DC; font-size:13px; font-weight:500; }
+      .toast-body  { color:#6A6050; font-size:11px; margin-top:2px; }
+      .toast-x { background:none; border:none; cursor:pointer; color:#4A4540; font-size:22px; line-height:1; padding:0 0 0 8px; }
+
+      /* ─── Keyframes ───────────────────────────────────────────────── */
+      @keyframes blink {
+        0%,100%{opacity:1;} 50%{opacity:.25;}
+      }
+      @keyframes td {
+        0%,100%{transform:translateY(0);opacity:.5;}
+        50%{transform:translateY(-7px);opacity:1;}
+      }
+      @keyframes rotate {
+        from{transform:rotate(0deg);}to{transform:rotate(360deg);}
+      }
+      @keyframes slideIn {
+        from{opacity:0;transform:translateY(14px);}
+        to{opacity:1;transform:translateY(0);}
+      }
+      @keyframes rowIn {
+        from{opacity:0;transform:translateX(-10px);}
+        to{opacity:1;transform:translateX(0);}
+      }
+      @keyframes fadeIn {
+        from{opacity:0;}to{opacity:1;}
+      }
+      @keyframes toastIn {
+        from{opacity:0;transform:translateY(16px) scale(.94);}
+        to{opacity:1;transform:translateY(0) scale(1);}
+      }
+
+      @media (max-width:600px) {
+        .nav-clock,.files-pill{display:none;}
+        .nav-tab{padding:0 12px;}
+        .tab-label{display:none;}
+        .chips-grid,.rform-grid{grid-template-columns:1fr;}
+        .files-thead{display:none;}
+        .files-row{grid-template-columns:1fr auto;}
+        .frow-badge,.frow-muted{display:none;}
