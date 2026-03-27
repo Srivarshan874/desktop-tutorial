@@ -114,9 +114,8 @@ Open `index.html` in your browser.
 
 ## 📬 Contact
 
-* 📧 Email: [hello@srivarshan.dev](mailto:hello@srivarshan.dev)
-* 💼 LinkedIn: [Add your link]
-* 🐙 GitHub: [Add your link]
+* 📧 Email: [Srivarshan L](mailto:srivarshankpl2k7@gmail.com)
+* 🐙 GitHub: [https://github.com/Srivarshan874]
 
 ---
 
